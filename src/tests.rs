@@ -1,7 +1,7 @@
 use crate::{
     poseidon2::{
-        BabyBearPoseidon2_16, BabyBearPoseidon2Backend, BabyBearPoseidon2_16HashAir,
-        KoalaBearPoseidon2_16, KoalaBearPoseidon2Backend, KoalaBearPoseidon2_16HashAir,
+        BabyBearPoseidon2Backend, BabyBearPoseidon2_16, BabyBearPoseidon2_16HashAir,
+        KoalaBearPoseidon2Backend, KoalaBearPoseidon2_16, KoalaBearPoseidon2_16HashAir,
         POSEIDON2_16_WIDTH,
     },
     preimage_relation, relation, HashInvocationAir, RelationChallenge, RelationField,
@@ -95,9 +95,13 @@ where
     F: PrimeCharacteristicRing,
 {
     let bytes = message.as_bytes();
-    assert!(bytes.len() <= WIDTH, "message does not fit in the hash width");
+    assert!(
+        bytes.len() <= WIDTH,
+        "message does not fit in the hash width"
+    );
     core::array::from_fn(|idx| {
-        bytes.get(idx)
+        bytes
+            .get(idx)
             .map_or(F::ZERO, |byte| F::from_u16((*byte).into()))
     })
 }
@@ -341,8 +345,7 @@ where
     (instance, witness)
 }
 
-fn poseidon2_preimage_cases(
-) -> Vec<(
+fn poseidon2_preimage_cases() -> Vec<(
     [RelationField<BabyBearPoseidon2Backend>; POSEIDON2_16_WIDTH],
     Vec<(usize, RelationField<BabyBearPoseidon2Backend>)>,
 )> {
@@ -500,9 +503,8 @@ fn poseidon2_16_relation_proof_without_linear_equations_lw2() {
     ]);
 
     let instance = PermutationInstanceBuilder::<RelationField<B>, POSEIDON2_16_WIDTH>::new();
-    let witness = PermutationWitnessBuilder::<BabyBearPoseidon2_16, POSEIDON2_16_WIDTH>::new(
-        permutation,
-    );
+    let witness =
+        PermutationWitnessBuilder::<BabyBearPoseidon2_16, POSEIDON2_16_WIDTH>::new(permutation);
 
     let input_vars = instance
         .allocator()
@@ -542,9 +544,8 @@ fn poseidon2_16_relation_proof_with_two_nonzero_linear_terms_lw2() {
     ]);
 
     let instance = PermutationInstanceBuilder::<RelationField<B>, POSEIDON2_16_WIDTH>::new();
-    let witness = PermutationWitnessBuilder::<BabyBearPoseidon2_16, POSEIDON2_16_WIDTH>::new(
-        permutation,
-    );
+    let witness =
+        PermutationWitnessBuilder::<BabyBearPoseidon2_16, POSEIDON2_16_WIDTH>::new(permutation);
 
     let input_vars = instance
         .allocator()
@@ -598,6 +599,73 @@ fn poseidon2_16_relation_proof_with_two_nonzero_linear_terms_lw2() {
 }
 
 #[test]
+fn poseidon2_16_relation_supports_reused_secret_inputs() {
+    type B = BabyBearPoseidon2Backend;
+    let backend = B::default();
+    let hash = BabyBearPoseidon2_16HashAir::default();
+    let permutation = BabyBearPoseidon2_16::default();
+    let input = sample_input::<RelationField<B>, POSEIDON2_16_WIDTH>();
+    let expected_output = permutation.permute(&input);
+
+    let instance = PermutationInstanceBuilder::<RelationField<B>, POSEIDON2_16_WIDTH>::new();
+    let witness = PermutationWitnessBuilder::<BabyBearPoseidon2_16, POSEIDON2_16_WIDTH>::new(
+        permutation.clone(),
+    );
+
+    let shared_input_vars = instance.allocator().allocate_vars::<POSEIDON2_16_WIDTH>();
+    let output_vars_a = instance.allocate_permutation(&shared_input_vars);
+    let output_vals_a = witness.allocate_permutation(&input);
+    let output_vars_b = instance.allocate_permutation(&shared_input_vars);
+    let output_vals_b = witness.allocate_permutation(&input);
+
+    instance.allocator().set_public_vars(
+        [(1usize, output_vars_a[1]), (2usize, output_vars_b[2])]
+            .into_iter()
+            .map(|(_, var)| var),
+        [expected_output[1], expected_output[2]],
+    );
+
+    instance.add_equation(LinearEquation::new(
+        core::iter::once((
+            <RelationField<B> as PrimeCharacteristicRing>::ONE,
+            output_vars_a[0],
+        )),
+        output_vals_a[0],
+    ));
+    witness.add_equation(LinearEquation::new(
+        core::iter::once((
+            <RelationField<B> as PrimeCharacteristicRing>::ONE,
+            output_vals_a[0],
+        )),
+        output_vals_a[0],
+    ));
+    instance.add_equation(LinearEquation::new(
+        core::iter::once((
+            <RelationField<B> as PrimeCharacteristicRing>::ONE,
+            output_vars_b[0],
+        )),
+        output_vals_b[0],
+    ));
+    witness.add_equation(LinearEquation::new(
+        core::iter::once((
+            <RelationField<B> as PrimeCharacteristicRing>::ONE,
+            output_vals_b[0],
+        )),
+        output_vals_b[0],
+    ));
+
+    let proof = relation::prove::<B, _, _, POSEIDON2_16_WIDTH, TEST_LINEAR_WIDTH>(
+        &backend, &hash, &instance, &witness,
+    );
+    assert!(
+        relation::verify::<B, _, POSEIDON2_16_WIDTH, TEST_LINEAR_WIDTH>(
+            &backend, &hash, &instance, &proof
+        )
+        .is_ok()
+    );
+}
+
+#[test]
 fn poseidon2_preimage_relation_accepts_valid_outputs_and_rejects_invalid_ones() {
     type B = BabyBearPoseidon2Backend;
 
@@ -605,46 +673,42 @@ fn poseidon2_preimage_relation_accepts_valid_outputs_and_rejects_invalid_ones() 
     let hash = BabyBearPoseidon2_16HashAir::default();
     let permutation = BabyBearPoseidon2_16::default();
     let cases = poseidon2_preimage_cases();
-    let (instance, witness) =
-        build_preimage_relation_instance_and_witness::<B, _, POSEIDON2_16_WIDTH>(
-            permutation, cases.clone(),
-        );
+    let (instance, witness) = build_preimage_relation_instance_and_witness::<
+        B,
+        _,
+        POSEIDON2_16_WIDTH,
+    >(permutation, cases.clone());
 
     assert_eq!(instance.public_vars().len(), 1 + 8 * cases.len());
 
     let proof = preimage_relation::prove::<B, _, _, POSEIDON2_16_WIDTH>(
         &backend, &hash, &instance, &witness,
     );
-    assert!(
-        preimage_relation::verify::<B, _, POSEIDON2_16_WIDTH>(&backend, &hash, &instance, &proof)
-            .is_ok()
-    );
+    assert!(preimage_relation::verify::<B, _, POSEIDON2_16_WIDTH>(
+        &backend, &hash, &instance, &proof
+    )
+    .is_ok());
 
     let mut bad_cases = cases;
     bad_cases[0].1[0].1 += <RelationField<B> as PrimeCharacteristicRing>::ONE;
-    let (bad_instance, _) =
-        build_preimage_relation_instance_and_witness::<B, _, POSEIDON2_16_WIDTH>(
-            BabyBearPoseidon2_16::default(),
-            bad_cases,
-        );
-    assert!(
-        preimage_relation::verify::<B, _, POSEIDON2_16_WIDTH>(
-            &backend,
-            &hash,
-            &bad_instance,
-            &proof
-        )
-        .is_err()
+    let (bad_instance, _) = build_preimage_relation_instance_and_witness::<B, _, POSEIDON2_16_WIDTH>(
+        BabyBearPoseidon2_16::default(),
+        bad_cases,
     );
+    assert!(preimage_relation::verify::<B, _, POSEIDON2_16_WIDTH>(
+        &backend,
+        &hash,
+        &bad_instance,
+        &proof
+    )
+    .is_err());
 
     let mut bad_proof = proof;
     bad_proof[0] ^= 0x01;
-    assert!(
-        preimage_relation::verify::<B, _, POSEIDON2_16_WIDTH>(
-            &backend, &hash, &instance, &bad_proof
-        )
-        .is_err()
-    );
+    assert!(preimage_relation::verify::<B, _, POSEIDON2_16_WIDTH>(
+        &backend, &hash, &instance, &bad_proof
+    )
+    .is_err());
 }
 
 #[cfg(feature = "keccak")]
@@ -758,19 +822,17 @@ fn keccak256_preimage_relation_accepts_documented_public_digests() {
     let hash = KeccakF1600HashAir::<RelationField<B>>::default();
     let permutation = KeccakF1600Permutation::<RelationField<B>>::default();
     let cases = documented_keccak256_preimage_cases::<B>();
-    let (instance, witness) =
-        build_preimage_relation_instance_and_witness::<B, _, KECCAK_WIDTH>(
-            permutation,
-            cases.clone(),
-        );
+    let (instance, witness) = build_preimage_relation_instance_and_witness::<B, _, KECCAK_WIDTH>(
+        permutation,
+        cases.clone(),
+    );
 
     assert_eq!(instance.public_vars().len(), 1 + 16 * cases.len());
 
     let proof =
         preimage_relation::prove::<B, _, _, KECCAK_WIDTH>(&backend, &hash, &instance, &witness);
     assert!(
-        preimage_relation::verify::<B, _, KECCAK_WIDTH>(&backend, &hash, &instance, &proof)
-            .is_ok()
+        preimage_relation::verify::<B, _, KECCAK_WIDTH>(&backend, &hash, &instance, &proof).is_ok()
     );
 
     let mut bad_cases = cases;
@@ -779,17 +841,20 @@ fn keccak256_preimage_relation_accepts_documented_public_digests() {
         KeccakF1600Permutation::<RelationField<B>>::default(),
         bad_cases,
     );
-    assert!(
-        preimage_relation::verify::<B, _, KECCAK_WIDTH>(&backend, &hash, &bad_instance, &proof)
-            .is_err()
-    );
+    assert!(preimage_relation::verify::<B, _, KECCAK_WIDTH>(
+        &backend,
+        &hash,
+        &bad_instance,
+        &proof
+    )
+    .is_err());
 
     let mut bad_proof = proof;
     bad_proof[0] ^= 0x01;
-    assert!(
-        preimage_relation::verify::<B, _, KECCAK_WIDTH>(&backend, &hash, &instance, &bad_proof)
-            .is_err()
-    );
+    assert!(preimage_relation::verify::<B, _, KECCAK_WIDTH>(
+        &backend, &hash, &instance, &bad_proof
+    )
+    .is_err());
 }
 
 #[cfg(feature = "keccak")]

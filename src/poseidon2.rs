@@ -50,7 +50,8 @@ impl Default for BabyBearPoseidon2_16 {
 
 impl spongefish::Permutation<POSEIDON2_16_WIDTH> for BabyBearPoseidon2_16
 where
-    Poseidon2BabyBear<POSEIDON2_16_WIDTH>: p3_symmetric::Permutation<[BabyBear; POSEIDON2_16_WIDTH]>,
+    Poseidon2BabyBear<POSEIDON2_16_WIDTH>:
+        p3_symmetric::Permutation<[BabyBear; POSEIDON2_16_WIDTH]>,
 {
     type U = BabyBear;
 

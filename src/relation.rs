@@ -31,6 +31,8 @@ pub const IO_LOOKUP_NAME: &str = "in-out";
 pub const PUB_LOOKUP_NAME: &str = "public-vars";
 /// The third lookup, checking linear relations between inputs and outputs.
 pub const LIN_LOOKUP_NAME: &str = "linear-constraints";
+/// The fourth lookup, checking secret source variables that are reused as inputs.
+pub const SEC_LOOKUP_NAME: &str = "secret-vars";
 
 type LinearConstraintsInstance<F> = LinearConstraints<FieldVar, F>;
 type LinearConstraintsWitness<F> = LinearConstraints<F, F>;
@@ -51,6 +53,17 @@ struct LookupCols<T, const WIDTH: usize> {
 struct PublicLookupCols<T> {
     var: T,
     val: T,
+    multiplicity: T,
+}
+
+#[repr(C)]
+struct SecretLookupMainCols<T> {
+    val: T,
+}
+
+#[repr(C)]
+struct SecretLookupPreprocessedCols<T> {
+    var: T,
     multiplicity: T,
 }
 
@@ -101,6 +114,48 @@ impl<T> Borrow<PublicLookupCols<T>> for [T] {
 impl<T> BorrowMut<PublicLookupCols<T>> for [T] {
     fn borrow_mut(&mut self) -> &mut PublicLookupCols<T> {
         let (prefix, shorts, suffix) = unsafe { self.align_to_mut::<PublicLookupCols<T>>() };
+        debug_assert!(prefix.is_empty());
+        debug_assert!(suffix.is_empty());
+        debug_assert_eq!(shorts.len(), 1);
+        &mut shorts[0]
+    }
+}
+
+impl<T> Borrow<SecretLookupMainCols<T>> for [T] {
+    fn borrow(&self) -> &SecretLookupMainCols<T> {
+        let (prefix, shorts, suffix) = unsafe { self.align_to::<SecretLookupMainCols<T>>() };
+        debug_assert!(prefix.is_empty());
+        debug_assert!(suffix.is_empty());
+        debug_assert_eq!(shorts.len(), 1);
+        &shorts[0]
+    }
+}
+
+impl<T> BorrowMut<SecretLookupMainCols<T>> for [T] {
+    fn borrow_mut(&mut self) -> &mut SecretLookupMainCols<T> {
+        let (prefix, shorts, suffix) = unsafe { self.align_to_mut::<SecretLookupMainCols<T>>() };
+        debug_assert!(prefix.is_empty());
+        debug_assert!(suffix.is_empty());
+        debug_assert_eq!(shorts.len(), 1);
+        &mut shorts[0]
+    }
+}
+
+impl<T> Borrow<SecretLookupPreprocessedCols<T>> for [T] {
+    fn borrow(&self) -> &SecretLookupPreprocessedCols<T> {
+        let (prefix, shorts, suffix) =
+            unsafe { self.align_to::<SecretLookupPreprocessedCols<T>>() };
+        debug_assert!(prefix.is_empty());
+        debug_assert!(suffix.is_empty());
+        debug_assert_eq!(shorts.len(), 1);
+        &shorts[0]
+    }
+}
+
+impl<T> BorrowMut<SecretLookupPreprocessedCols<T>> for [T] {
+    fn borrow_mut(&mut self) -> &mut SecretLookupPreprocessedCols<T> {
+        let (prefix, shorts, suffix) =
+            unsafe { self.align_to_mut::<SecretLookupPreprocessedCols<T>>() };
         debug_assert!(prefix.is_empty());
         debug_assert!(suffix.is_empty());
         debug_assert_eq!(shorts.len(), 1);
@@ -162,6 +217,14 @@ const fn num_public_lookup_cols() -> usize {
     size_of::<PublicLookupCols<u8>>()
 }
 
+const fn num_secret_lookup_main_cols() -> usize {
+    size_of::<SecretLookupMainCols<u8>>()
+}
+
+const fn num_secret_lookup_preprocessed_cols() -> usize {
+    size_of::<SecretLookupPreprocessedCols<u8>>()
+}
+
 const fn num_linear_main_cols<const LIN_WIDTH: usize>() -> usize {
     size_of::<LinearConstraintCols<u8, LIN_WIDTH>>()
 }
@@ -185,6 +248,12 @@ struct PublicVarLookupAir<F, const WIDTH: usize> {
 }
 
 #[derive(Clone)]
+struct SecretVarLookupAir<F, const WIDTH: usize> {
+    instance: PermutationInstanceBuilder<F, WIDTH>,
+    trace_len: usize,
+}
+
+#[derive(Clone)]
 struct LinearConstraintsAir<F, const WIDTH: usize, const LIN_WIDTH: usize> {
     instance: PermutationInstanceBuilder<F, WIDTH>,
     constraints: LinearConstraintsInstance<F>,
@@ -195,6 +264,7 @@ struct LinearConstraintsAir<F, const WIDTH: usize, const LIN_WIDTH: usize> {
 enum GenericHashRelationAir<H, F, const WIDTH: usize, const LIN_WIDTH: usize> {
     Hash(Box<HashLookupAir<H, F, WIDTH, LIN_WIDTH>>),
     Public(PublicVarLookupAir<F, WIDTH>),
+    Secret(SecretVarLookupAir<F, WIDTH>),
     Linear(LinearConstraintsAir<F, WIDTH, LIN_WIDTH>),
 }
 
@@ -215,6 +285,16 @@ impl<H, F, const WIDTH: usize, const LIN_WIDTH: usize> HashLookupAir<H, F, WIDTH
 }
 
 impl<F, const WIDTH: usize> PublicVarLookupAir<F, WIDTH> {
+    fn new(instance: PermutationInstanceBuilder<F, WIDTH>, trace_len: usize) -> Self {
+        assert!(trace_len.is_power_of_two());
+        Self {
+            instance,
+            trace_len,
+        }
+    }
+}
+
+impl<F, const WIDTH: usize> SecretVarLookupAir<F, WIDTH> {
     fn new(instance: PermutationInstanceBuilder<F, WIDTH>, trace_len: usize) -> Self {
         assert!(trace_len.is_power_of_two());
         Self {
@@ -315,6 +395,7 @@ where
             target_len,
         ))),
         GenericHashRelationAir::Public(PublicVarLookupAir::new(instance.clone(), target_len)),
+        GenericHashRelationAir::Secret(SecretVarLookupAir::new(instance.clone(), target_len)),
         GenericHashRelationAir::Linear(
             LinearConstraintsAir::<RelationField<B>, WIDTH, LIN_WIDTH>::new(
                 instance.clone(),
@@ -355,6 +436,7 @@ where
     let trace_len = hash_trace.height().max(target_len_with_linear(instance));
     let trace = pad_dense_matrix_to_height(hash_trace, trace_len);
     let public_trace = build_public_lookup_main_trace::<F>(trace_len);
+    let secret_trace = build_secret_lookup_main_trace::<F, P, WIDTH>(instance, witness, trace_len);
     let linear_trace = build_linear_constraints_trace::<F, LIN_WIDTH>(&linear_witness);
 
     let airs = vec![
@@ -367,6 +449,7 @@ where
             ),
         )),
         GenericHashRelationAir::Public(PublicVarLookupAir::new(instance.clone(), trace_len)),
+        GenericHashRelationAir::Secret(SecretVarLookupAir::new(instance.clone(), trace_len)),
         GenericHashRelationAir::Linear(LinearConstraintsAir::<F, WIDTH, LIN_WIDTH>::new(
             instance.clone(),
             linear_constraints,
@@ -374,7 +457,7 @@ where
         )),
     ];
 
-    (airs, vec![trace, public_trace, linear_trace])
+    (airs, vec![trace, public_trace, secret_trace, linear_trace])
 }
 
 impl<H, F, const WIDTH: usize, const LIN_WIDTH: usize> BaseAir<F>
@@ -387,6 +470,7 @@ where
         match self {
             Self::Hash(air) => <HashLookupAir<H, F, WIDTH, LIN_WIDTH> as BaseAir<F>>::width(air),
             Self::Public(air) => <PublicVarLookupAir<F, WIDTH> as BaseAir<F>>::width(air),
+            Self::Secret(air) => <SecretVarLookupAir<F, WIDTH> as BaseAir<F>>::width(air),
             Self::Linear(air) => {
                 <LinearConstraintsAir<F, WIDTH, LIN_WIDTH> as BaseAir<F>>::width(air)
             }
@@ -400,6 +484,9 @@ where
             }
             Self::Public(air) => {
                 <PublicVarLookupAir<F, WIDTH> as BaseAir<F>>::preprocessed_trace(air)
+            }
+            Self::Secret(air) => {
+                <SecretVarLookupAir<F, WIDTH> as BaseAir<F>>::preprocessed_trace(air)
             }
             Self::Linear(air) => {
                 <LinearConstraintsAir<F, WIDTH, LIN_WIDTH> as BaseAir<F>>::preprocessed_trace(air)
@@ -430,6 +517,7 @@ where
         );
 
         let public_multiplicities = public_multiplicities(&self.builder);
+        let secret_multiplicities = secret_source_multiplicities(&self.builder);
         let linear_multiplicities = self.linear_constraints.as_ref().map(lin_multiplicities);
         let linear_lookup_multiplicities = self.linear_constraints.as_ref().map(|constraints| {
             linear_lookup_multiplicities::<WIDTH>(
@@ -438,7 +526,8 @@ where
             )
         });
         let output_multiplicities = output_multiplicities(input_outputs.as_ref(), vars_count);
-        let input_multiplicities = input_multiplicities(input_outputs.as_ref(), vars_count);
+        let input_multiplicities =
+            input_multiplicities(input_outputs.as_ref(), vars_count, &secret_multiplicities);
         let linear_inputs = linear_lookup_multiplicities
             .as_ref()
             .map(|(input, _)| input.clone())
@@ -494,6 +583,20 @@ where
     }
 }
 
+impl<F, const WIDTH: usize> BaseAir<F> for SecretVarLookupAir<F, WIDTH>
+where
+    F: Field + Unit + PartialEq + Send + Sync,
+{
+    fn width(&self) -> usize {
+        num_secret_lookup_main_cols()
+    }
+
+    fn preprocessed_trace(&self) -> Option<RowMajorMatrix<F>> {
+        let trace = build_secret_lookup_preprocessed_trace(&self.instance);
+        Some(pad_dense_matrix_to_height(trace, self.trace_len))
+    }
+}
+
 impl<F, const WIDTH: usize, const LIN_WIDTH: usize> BaseAir<F>
     for LinearConstraintsAir<F, WIDTH, LIN_WIDTH>
 where
@@ -523,6 +626,7 @@ where
                 <HashLookupAir<H, F, WIDTH, LIN_WIDTH> as Air<AB>>::eval(air, builder)
             }
             Self::Public(air) => <PublicVarLookupAir<F, WIDTH> as Air<AB>>::eval(air, builder),
+            Self::Secret(air) => <SecretVarLookupAir<F, WIDTH> as Air<AB>>::eval(air, builder),
             Self::Linear(air) => {
                 <LinearConstraintsAir<F, WIDTH, LIN_WIDTH> as Air<AB>>::eval(air, builder)
             }
@@ -543,6 +647,14 @@ where
 }
 
 impl<AB, F, const WIDTH: usize> Air<AB> for PublicVarLookupAir<F, WIDTH>
+where
+    AB: AirBuilder<F = F>,
+    F: Field + Unit + PartialEq + Send + Sync,
+{
+    fn eval(&self, _builder: &mut AB) {}
+}
+
+impl<AB, F, const WIDTH: usize> Air<AB> for SecretVarLookupAir<F, WIDTH>
 where
     AB: AirBuilder<F = F>,
     F: Field + Unit + PartialEq + Send + Sync,
@@ -586,6 +698,9 @@ where
             Self::Public(air) => {
                 <PublicVarLookupAir<F, WIDTH> as LookupAir<F>>::add_lookup_columns(air)
             }
+            Self::Secret(air) => {
+                <SecretVarLookupAir<F, WIDTH> as LookupAir<F>>::add_lookup_columns(air)
+            }
             Self::Linear(air) => {
                 <LinearConstraintsAir<F, WIDTH, LIN_WIDTH> as LookupAir<F>>::add_lookup_columns(air)
             }
@@ -598,6 +713,7 @@ where
                 <HashLookupAir<H, F, WIDTH, LIN_WIDTH> as LookupAir<F>>::get_lookups(air)
             }
             Self::Public(air) => <PublicVarLookupAir<F, WIDTH> as LookupAir<F>>::get_lookups(air),
+            Self::Secret(air) => <SecretVarLookupAir<F, WIDTH> as LookupAir<F>>::get_lookups(air),
             Self::Linear(air) => {
                 <LinearConstraintsAir<F, WIDTH, LIN_WIDTH> as LookupAir<F>>::get_lookups(air)
             }
@@ -713,6 +829,33 @@ where
     }
 }
 
+impl<F, const WIDTH: usize> LookupAir<F> for SecretVarLookupAir<F, WIDTH>
+where
+    F: Field + Unit + PartialEq + Send + Sync,
+{
+    fn get_lookups(&mut self) -> Vec<Lookup<F>> {
+        let symbolic = SymbolicAirBuilder::<F>::new(AirLayout {
+            preprocessed_width: num_secret_lookup_preprocessed_cols(),
+            main_width: BaseAir::<F>::width(self),
+            ..Default::default()
+        });
+        let main = symbolic.main();
+        let main_row = main.row_slice(0).expect("symbolic row should exist");
+        let main_cols: &SecretLookupMainCols<_> = (*main_row).borrow();
+        let preprocessed = symbolic.preprocessed();
+        let pre_row = preprocessed
+            .row_slice(0)
+            .expect("symbolic preprocessed row should exist");
+        let pre_cols: &SecretLookupPreprocessedCols<_> = (*pre_row).borrow();
+        vec![Lookup::new(
+            Kind::Global(IO_LOOKUP_NAME.to_string()),
+            vec![vec![pre_cols.var.into(), main_cols.val.into()]],
+            vec![Direction::Receive.multiplicity(pre_cols.multiplicity.into())],
+            vec![0],
+        )]
+    }
+}
+
 impl<F, const WIDTH: usize, const LIN_WIDTH: usize> LookupAir<F>
     for LinearConstraintsAir<F, WIDTH, LIN_WIDTH>
 where
@@ -802,6 +945,85 @@ where
     DenseMatrix::new(vec![<F as PrimeCharacteristicRing>::ZERO; trace_len], 1)
 }
 
+fn build_secret_lookup_preprocessed_trace<F, const WIDTH: usize>(
+    instance: &PermutationInstanceBuilder<F, WIDTH>,
+) -> DenseMatrix<F>
+where
+    F: Field + Unit + PartialEq + Send + Sync,
+{
+    let secret_sources = secret_source_multiplicities(instance);
+    let secret_vars = secret_sources
+        .iter()
+        .enumerate()
+        .filter_map(|(var, count)| count.map(|count| (var, count)))
+        .collect::<Vec<_>>();
+    let width = num_secret_lookup_preprocessed_cols();
+    let height = secret_vars.len().next_power_of_two().max(1);
+    let mut values = vec![<F as PrimeCharacteristicRing>::ZERO; width * height];
+
+    for (row_idx, (var, multiplicity)) in secret_vars.into_iter().enumerate() {
+        let offset = row_idx * width;
+        let row = &mut values[offset..offset + width];
+        let cols: &mut SecretLookupPreprocessedCols<F> = row.borrow_mut();
+        cols.var = F::from_usize(var);
+        cols.multiplicity = F::from_usize(multiplicity);
+    }
+
+    DenseMatrix::new(values, width)
+}
+
+fn build_secret_lookup_main_trace<F, P, const WIDTH: usize>(
+    instance: &PermutationInstanceBuilder<F, WIDTH>,
+    witness: &PermutationWitnessBuilder<P, WIDTH>,
+    trace_len: usize,
+) -> DenseMatrix<F>
+where
+    F: Field + Unit + PartialEq + Send + Sync,
+    P: Permutation<WIDTH, U = F>,
+{
+    let secret_sources = secret_source_multiplicities(instance);
+    let mut witness_values = vec![None; instance.allocator().vars_count()];
+    let constraints = instance.constraints();
+    let witness_trace = witness.trace();
+
+    for (pair, trace_pair) in constraints
+        .as_ref()
+        .iter()
+        .zip(witness_trace.as_ref().iter())
+    {
+        for (var, value) in pair.input.iter().zip(trace_pair.input.iter()) {
+            if secret_sources.get(var.0).and_then(|count| *count).is_none() {
+                continue;
+            }
+            match &mut witness_values[var.0] {
+                Some(existing) => assert_eq!(
+                    existing, value,
+                    "secret source witness value changed across repeated uses for var {}",
+                    var.0
+                ),
+                slot @ None => *slot = Some(*value),
+            }
+        }
+    }
+
+    let width = num_secret_lookup_main_cols();
+    let mut values = vec![<F as PrimeCharacteristicRing>::ZERO; width * trace_len];
+    for (row_idx, value) in secret_sources
+        .iter()
+        .enumerate()
+        .filter_map(|(var, count)| {
+            count.map(|_| witness_values[var].expect("missing secret witness value"))
+        })
+        .enumerate()
+    {
+        let row = &mut values[row_idx * width..(row_idx + 1) * width];
+        let cols: &mut SecretLookupMainCols<F> = row.borrow_mut();
+        cols.val = value;
+    }
+
+    DenseMatrix::new(values, width)
+}
+
 fn build_lin_lookup_trace<F, const WIDTH: usize, const LIN_WIDTH: usize>(
     instance: &PermutationInstanceBuilder<F, WIDTH>,
     lc: &LinearConstraintsInstance<F>,
@@ -876,6 +1098,7 @@ fn output_multiplicities<const WIDTH: usize>(
 fn input_multiplicities<const WIDTH: usize>(
     constraints: &[QueryAnswerPair<FieldVar, WIDTH>],
     vars_count: usize,
+    secret_sources: &[Option<usize>],
 ) -> Vec<[usize; WIDTH]> {
     let mut outputs = vec![false; vars_count];
     for pair in constraints {
@@ -886,7 +1109,13 @@ fn input_multiplicities<const WIDTH: usize>(
 
     constraints
         .iter()
-        .map(|pair| pair.input.map(|var| usize::from(outputs[var.0])))
+        .map(|pair| {
+            pair.input.map(|var| {
+                usize::from(
+                    outputs[var.0] || secret_sources.get(var.0).and_then(|count| *count).is_some(),
+                )
+            })
+        })
         .collect()
 }
 
@@ -958,6 +1187,43 @@ where
     mult
 }
 
+fn secret_source_multiplicities<F, const WIDTH: usize>(
+    instance: &PermutationInstanceBuilder<F, WIDTH>,
+) -> Vec<Option<usize>>
+where
+    F: Field + Unit + PartialEq,
+{
+    let constraints = instance.constraints();
+    let vars_count = instance.allocator().vars_count();
+    let mut outputs = vec![false; vars_count];
+    let mut is_public = vec![false; vars_count];
+    let mut counts = vec![0usize; vars_count];
+
+    for (var, _) in instance.public_vars() {
+        is_public[var.0] = true;
+    }
+    for pair in constraints.as_ref() {
+        for var in pair.output {
+            outputs[var.0] = true;
+        }
+        for var in pair.input {
+            counts[var.0] += 1;
+        }
+    }
+
+    counts
+        .into_iter()
+        .enumerate()
+        .map(|(var, count)| {
+            if count > 0 && !outputs[var] && !is_public[var] {
+                Some(count)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn lin_multiplicities<F>(lc: &LinearConstraintsInstance<F>) -> Vec<Option<usize>>
 where
     F: Field + Unit + PartialEq,
@@ -1001,12 +1267,17 @@ fn target_len_with_linear<F, const WIDTH: usize>(
 where
     F: Field + Unit + PartialEq,
 {
+    let secret_source_len = secret_source_multiplicities(instance)
+        .into_iter()
+        .flatten()
+        .count();
     instance
         .constraints()
         .as_ref()
         .len()
         .max(instance.public_vars().len())
         .max(instance.linear_constraints().as_ref().len())
+        .max(secret_source_len)
         .next_power_of_two()
         .max(1)
 }
